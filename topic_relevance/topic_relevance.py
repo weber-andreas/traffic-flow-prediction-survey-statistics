@@ -10,14 +10,13 @@ import pandas as pd
 import requests
 import seaborn as sns
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
 def query_arxiv(search_query, max_results=50000):
     max_results_per_call = min(max_results, 1000)
     base_url = "http://export.arxiv.org/api/query?"
-    # arXiv API uses start and max_results for pagination
     search_query = search_query.replace(" ", "+")
 
     xml_reponses = []
@@ -34,47 +33,73 @@ def query_arxiv(search_query, max_results=50000):
     return xml_reponses
 
 
-def parse_arxiv_response(xml_reponses: list):
-    ns = {"atom": "http://www.w3.org/2005/Atom"}
-    years = []
-    for i, xml_data in enumerate(xml_reponses):
-        logger.info(f"Parsing response {i + 1}/{len(xml_reponses)}")
-        current_years = parse_single_arxiv_response(xml_data, ns)
-        years.extend(current_years)
-    return years
-
-
 def parse_single_arxiv_response(xml_data: str, ns):
-    root = ET.fromstring(xml_data)
-    years = []
+    try:
+        root = ET.fromstring(xml_data)
+    except ET.ParseError as e:
+        logger.warning(f"XML parsing failed: {e}")
+        return []
+
+    records = []
     for entry in root.findall("atom:entry", ns):
-        # published date like '2024-05-01T12:34:56Z'
         published = entry.find("atom:published", ns)
-        if published is None:
-            logger.info("No published date found in entry, skipping...")
+        title = entry.find("atom:title", ns)
+        authors = entry.findall("atom:author/atom:name", ns)
+
+        if (
+            published is None
+            or published.text is None
+            or title is None
+            or title.text is None
+            or not authors  # This is a list, safe to check directly
+        ):
+            logger.debug("Skipping incomplete entry")
             continue
-        published_str = published.text
-        if not published_str:
+
+        # Clean and validate fields
+        published_str = published.text.strip()
+        title_str = title.text.strip().replace("\n", " ").replace("  ", " ")
+        authors_lst = [a.text.strip() for a in authors if a.text and a.text.strip()]
+
+        if not (published_str and title_str and authors_lst):
+            logger.debug("Skipping entry with empty cleaned fields")
+            continue
+
+        # Parse year safely
+        if not published_str[:4].isdigit():
+            logger.debug(f"Skipping invalid year format: {published_str}")
             continue
         year = int(published_str[:4])
-        years.append(year)
-    return years
+
+        authors_str = ", ".join(authors_lst)
+
+        records.append({"Title": title_str, "Authors": authors_str, "Year": year})
+
+    return records
 
 
-def plot_histogram_sns(years: list, topic: str, save_path=None, interpolate=True):
+def parse_arxiv_response(xml_responses: list):
+    ns = {"atom": "http://www.w3.org/2005/Atom"}
+    all_records = []
+    for i, xml_data in enumerate(xml_responses):
+        logger.info(f"Parsing response {i + 1}/{len(xml_responses)}")
+        records = parse_single_arxiv_response(xml_data, ns)
+        all_records.extend(records)
+    return all_records
+
+
+def plot_histogram(df: pd.DataFrame, topic: str, save_path=None, interpolate=True):
     sns.set(style="whitegrid")
     plt.figure(figsize=(6, 3))
 
     current_year = datetime.datetime.now().year
     current_month = datetime.datetime.now().month
 
-    # Count publications per year
-    years = [int(year) for year in years]
+    years = df["Year"].astype(int).tolist()
     year_counts = collections.Counter(years)
     all_years = list(range(min(years), current_year + 1))
     counts = [year_counts.get(y, 0) for y in all_years]
 
-    # Interpolate current year
     if interpolate:
         fraction_year_elapsed = current_month / 12
         actual = year_counts[current_year]
@@ -96,17 +121,16 @@ def plot_histogram_sns(years: list, topic: str, save_path=None, interpolate=True
     total_papers = len(years)
     title_string = (
         f"arXiv Publications on '{topic.capitalize()}'"
-        f"by Year\nTotal: {total_papers} papers"
+        f" by Year\nTotal: {total_papers} papers"
     )
     plt.xlabel("Year")
     plt.ylabel("Number of Publications")
     plt.title(title_string, fontsize=13, pad=10)
 
-    # x-ticks
     str_years = [str(y) for y in all_years]
-    lables = [str(y) for y in all_years if y % 5 == 0]
-    xticks = [str_years.index(y) for y in lables]
-    plt.xticks(xticks, lables, rotation=45)
+    labels = [str(y) for y in all_years if y % 5 == 0]
+    xticks = [str_years.index(y) for y in labels]
+    plt.xticks(xticks, labels, rotation=45)
 
     plt.tight_layout()
     if save_path:
@@ -114,10 +138,41 @@ def plot_histogram_sns(years: list, topic: str, save_path=None, interpolate=True
     plt.show()
 
 
-def parse_arguments():
+def main():
+    args = parse_args()
+    res_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 
+    topic_name = args.topic.replace(" ", "_").lower()
+    file_name = f"arxiv_{topic_name}_statistics.csv"
+    os.makedirs(res_dir, exist_ok=True)
+
+    file_path = os.path.join(res_dir, args.csv_file or file_name)
+
+    if args.csv_file:
+        if not os.path.exists(file_path):
+            logger.error(f"CSV file not found under file path '{file_path}'")
+            return
+        logger.info(f"Reading existing CSV from {file_path}")
+        statistic = pd.read_csv(file_path)
+    else:
+        logger.info(f"Querying arXiv for topic: {args.topic}")
+        xml_data = query_arxiv(args.topic, max_results=args.max_results)
+        records = parse_arxiv_response(xml_data)
+
+        logger.info(f"Found {len(records)} papers on archive")
+
+        statistic = pd.DataFrame(records)  # Has Title, Authors, Year
+        statistic.to_csv(file_path, index=False)
+        logger.info(f"Saved statistics CSV to {file_path}")
+
+    plot_histogram(
+        statistic, args.topic, save_path=file_path, interpolate=not args.no_interpolate
+    )
+
+
+def parse_args():
     parser = argparse.ArgumentParser(
-        description="Query arXiv, save publication years, and plot histogram"
+        description="Query arXiv, save publication titles/authors/years, and plot histogram"
     )
     parser.add_argument(
         "--topic",
@@ -134,8 +189,7 @@ def parse_arguments():
     parser.add_argument(
         "--csv-file",
         type=str,
-        default="arxiv_traffic_prediction_statistics.csv",
-        help="Skip querying and parsing, just read existing CSV and plot",
+        help="Path to save the CSV file with statistics",
     )
     parser.add_argument(
         "--no-interpolate",
@@ -146,21 +200,8 @@ def parse_arguments():
     return parser.parse_args()
 
 
+# Example usage:
+# python topic_relevance.py --topic "traffic prediction" --max-results 10
+# python topic_relevance.py --topic "traffic prediction" --csv-file "arxiv_traffic_prediction_statistics.csv"
 if __name__ == "__main__":
-    topic = "traffic prediction"
-    file_name = f"arxiv_{topic.replace(' ', '_')}_statistics.csv"
-    file_path = os.path.join(os.getcwd(), "topic_relevance", "res", file_name)
-
-    # logger.info(f"Querying arXiv for topic: {topic}")
-    # xml_data = query_arxiv(topic, max_results=50000)
-    # years = parse_arxiv_response(xml_data)
-
-    # logger.info(f"Found {len(years)} papers on archive")
-
-    # statistic = pd.DataFrame(years, columns=["Year"])
-    # statistic.to_csv(file_path, index=False)
-
-    # Read the CSV file and plot using seaborn
-    statistc = pd.read_csv(file_path)
-    years = statistc["Year"].tolist()
-    plot_histogram_sns(years, topic, save_path=file_path)
+    main()
