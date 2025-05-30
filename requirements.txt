@@ -1,0 +1,5 @@
+scholarly
+selenium
+matplotlib
+pandas
+plotly
