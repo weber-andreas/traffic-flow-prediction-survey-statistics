@@ -193,4 +193,7 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
-.DS_Store
+*.DS_Store
+.vscode/
+
+*.xlsx
